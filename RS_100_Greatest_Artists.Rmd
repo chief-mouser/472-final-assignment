@@ -1,0 +1,526 @@
+---
+title: "Final Assignment"
+author: "35478"
+date: "AT 2023"
+output: html_document
+---
+
+```{r setup, include=FALSE} 
+knitr::opts_chunk$set(echo = FALSE) 
+
+```
+
+The GitHub repo for this project can be found [here](https://github.com/chief-mouser/472-final-assignment).
+
+## Introduction
+
+This project aims to determine the enduring engagement of music by Rolling Stone Magazine’s 100 Greatest Artists for Spotify listeners in the UK at the end of 2023. The project is structured as follows: First, a working definition of ‘engagement’ is constructed with follower count and popularity metrics from Spotify’s Web API. Second, exploratory analysis is conducted on the relationship between the RS ranking and the engagement variables. Third, a selection of features or characteristics of the top tracks of each artist are tested for their effect on the ranking-engagement relationship.
+
+## Data
+
+The list of [“100 Greatest Artists of All Time”](https://www.rollingstone.com/music/music-lists/100-greatest-artists-147446/) was scraped from the Rolling Stone Magazine website with the following function ‘get_artist_rank’. The resulting data contains 2 variables: artist name and ranking. One of the artists, Parliament and Funkadelic, used to exist as two bands which later merged into a supergroup. The tracks that are usually credited to this entity were mostly created under Parliament, so the ‘artist’ value was changed to reflect this.
+```{r, include=FALSE,warning=FALSE}
+library(RSelenium)
+library(tidyverse)
+library(DBI)
+
+```
+
+```{r}
+# Web scraping function for '100 Greatest Artists' by Rolling Stones Magazine
+get_artist_rank <- function(database_name, sleep_cookie = 5, sleep_load_more = 5) {
+  
+  # 1. Initialize db connection and create table
+  db <- dbConnect(RSQLite::SQLite(), database_name)
+  table_name <- "Greatest_Artists"
+  columns <- c("rank INTEGER", "artist TEXT")
+  dbExecute(db, paste("CREATE TABLE IF NOT EXISTS", table_name, "(", paste(columns, collapse = ", "), ")"))
+
+  # 2. Start the Selenium server
+  rD <- rsDriver(browser=c("firefox"), verbose = F, port = netstat::free_port(random = TRUE), chromever = NULL) 
+  driver <- rD[["client"]] 
+  
+  # 3. Load url and navigate
+  greatest_url <- "https://www.rollingstone.com/music/music-lists/100-greatest-artists-147446/"
+  driver$navigate(greatest_url)
+
+  # 4. Handle cookies popup
+  Sys.sleep(sleep_cookie)
+  accept_button <- driver$findElement(using = 'xpath', "//button[@id='onetrust-accept-btn-handler']")
+  if (!is.null(accept_button)) {
+    accept_button$clickElement()
+  }
+
+  # 5. Loop over list
+  i <- 0
+  while (i<=99) {
+    position_xpath <- paste(sprintf("//div[@class='c-gallery-vertical__slide-wrapper' and @data-slide-index='%d']", i),sep = "")
+    
+    # 5a. Scrape rank and artist name
+    rank_xpath <- paste(position_xpath, "//span[@class='c-gallery-vertical-album__number']", sep = "")
+    rank_element <- driver$findElement(using = 'xpath', value = rank_xpath)
+    rank_text <- rank_element$getElementText()[[1]]
+    rank_ <- as.integer(rank_text)
+  
+    artist_xpath <- paste(position_xpath, "//h2[@class='c-gallery-vertical-album__title']", sep = "")
+    artist_element <- driver$findElement(using = 'xpath', value = artist_xpath)
+    artist_text <- artist_element$getElementText()[[1]]
+    artist_ <- as.character(artist_text)
+    
+    # 5b. Write into database (replace existing records based on rank)
+    query <- "REPLACE INTO Greatest_Artists (rank, artist) VALUES (?, ?)"
+    dbExecute(db, query, list(rank_, artist_))
+
+    # 5c. Click 'Load More' button
+    if (i == 49) {
+      load_more_button <- driver$findElement(using = 'xpath', "//a[contains(text(), 'Load More')]")
+      if (!is.null(load_more_button)) {
+        load_more_button$clickElement()
+        Sys.sleep(sleep_load_more)
+      } else {
+        break
+      }
+    }
+
+    i <- i + 1
+  }
+
+  # 6. Disconnect from database and close remote driver
+  dbDisconnect(db)
+  driver$close()
+}
+```
+
+```{r, echo=TRUE, eval=FALSE}
+# Scrape 100 Greatest Artists for rank and artist name
+get_artist_rank("472_final.db")
+
+```
+
+```{r, echo=TRUE, eval=FALSE}
+# Handle 'Parliament and Funkadelic' exception
+rank_to_update <- 58
+parliament <- "Parliament"
+db <- dbConnect(RSQLite::SQLite(), "472_final.db")
+update <- "UPDATE Greatest_Artists SET artist = ? WHERE rank = ?"
+dbExecute(db, update, list(parliament, rank_to_update))
+```
+
+To access data from Spotify, artists’ unique Spotify IDs were obtained by scraping the URLs of each artist page using ‘get_spotify_id’.
+
+```{r}
+# Web scraping function for artists Spotify URL and ID
+get_spotify_id <- function(database_name, artist_list, sleep_cookie = 5, sleep_search = 4, sleep_load = 4){
+  
+  # 1. Initialize db connection
+  db <- dbConnect(RSQLite::SQLite(), database_name)
+  table_name <- "Greatest_Artists"
+  if (!"url" %in% dbListFields(db, table_name)) {
+    dbExecute(db, paste("ALTER TABLE", table_name, "ADD COLUMN url"))
+  }
+  
+  # 2. Start the Selenium server
+  rD <- rsDriver(browser=c("firefox"), verbose = F, port = netstat::free_port(random = TRUE), chromever = NULL) 
+  driver <- rD[["client"]] 
+  
+  # 3. Load url and navigate
+  spotify_url <- "https://open.spotify.com"
+  driver$navigate(spotify_url)
+  
+  # 4. Handle cookie pop-up
+  Sys.sleep(sleep_cookie)
+  accept_button <- driver$findElement(using = 'xpath', '//*[@id="onetrust-accept-btn-handler"]')
+  if (!is.null(accept_button)) {
+    accept_button$clickElement()
+  }
+  
+  # 5. Loop over artist_list
+  for(artist in artist_list){
+    
+    # 5a. Send artist name
+    Sys.sleep(sleep_search)
+    search_button <- driver$findElement(using = "xpath", value = '//*[@id="main"]/div/div[2]/div[1]/nav/div[1]/ul/li[2]/a')
+    search_button$clickElement()
+    Sys.sleep(sleep_search)
+    search_field <- driver$findElement(using = 'xpath', value = '/html/body/div[4]/div/div[2]/div[3]/header/div[3]/div/div/form/input')
+    search_field$sendKeysToElement(list(artist))
+
+    # 5b. Identify artist page
+    Sys.sleep(sleep_load)
+    artist_page <- driver$findElement(using = 'xpath', value = '//*[@id="searchPage"]/div/div/section[4]/div[2]/div[1]/div/div[2]/a')
+    artist_page$clickElement()
+    Sys.sleep(sleep_load)
+    
+    # 5c. Get artist url
+    artist_url <- driver$getCurrentUrl()
+    
+    # 5d. Write into database
+    query <- sprintf("UPDATE Greatest_Artists SET url = '%s' WHERE artist = '%s'", artist_url, artist)
+    dbExecute(db, query)
+    
+    # 5e. Return to search page
+    search_button$clickElement()
+  }
+
+  # 6. Disconnect
+  dbDisconnect(db)
+  driver$close()  
+}
+```
+
+```{r}
+# Get list of artists for Spotify API
+db <- dbConnect(RSQLite::SQLite(), dbname = '472_final.db')
+query <- "SELECT * FROM Greatest_Artists ORDER BY rank ASC"
+data <- dbGetQuery(db, query)
+dbDisconnect(db)
+
+artist_list <- data$artist
+
+```
+
+```{r, echo=TRUE, eval=FALSE}
+# Scrape artist URLs
+get_spotify_id('472_final.db', artist_list)
+```
+
+```{r}
+# Get artist Spotify ID from URL
+data <- data %>%
+  mutate(spotify_id = str_extract(url, "(?<=artist/).*"))
+```
+
+Through Spotify Web API, artists’ catalogues were accessed with ‘get_artists’. The resulting data contains the following variables: follower count, popularity, and genres. 
+
+```{r}
+library(spotifyr)
+library(dotenv)
+```
+
+```{r}
+# Access Spotify API with token
+load_dot_env()
+client_id <- Sys.getenv("SPOTIFY_CLIENT_ID")
+client_secret <- Sys.getenv("SPOTIFY_CLIENT_SECRET")
+redirect_uri <- Sys.getenv("REDIRECT_URI")
+access_token <- get_spotify_access_token()
+```
+
+```{r}
+# Splitting Spotify IDs into two lists of 50 due to arg limit
+first_50_spotify_ids <- head(str_extract(data$url, "(?<=artist/).*"), 50)
+last_50_spotify_ids <- tail(str_extract(data$url, "(?<=artist/).*"), 50)
+
+```
+
+```{r, echo=TRUE}
+# Fetch artist data from API
+first50_catalogue <- get_artists(first_50_spotify_ids,
+          authorization = access_token,
+          include_meta_info = FALSE) 
+last50_catalogue <- get_artists(last_50_spotify_ids, 
+          authorization = access_token,
+          include_meta_info = FALSE)
+
+```
+
+```{r}
+# Combine
+artist_catalogue <- rbind(first50_catalogue, last50_catalogue)
+
+# Keep relevant data
+artist_catalogue <- artist_catalogue %>%
+  select(-href, - images, -uri, -external_urls.spotify, -followers.href, -type) %>%
+  rename(followers = followers.total) %>%
+  rename(artist = name) %>%
+  mutate(rank = row_number()) %>%
+  select(rank, artist, id, followers, popularity)
+
+```
+
+Finally, audio features of certain tracks were accessed with ‘get_artist_top_tracks’ and ‘get_track_audio_features’:
+
+```{r, echo=TRUE}
+# Create an empty list to store the results
+top_tracks_list <- list()
+
+# Loop through each artist
+for (i in 1:nrow(artist_catalogue)) {
+  artist_id <- artist_catalogue$id[i]
+  artist_name <- artist_catalogue$artist[i]
+  
+  # Call get_artists_top_tracks and store the result in the list
+  top_tracks <- get_artist_top_tracks(
+    artist_id,
+    market = "GB",
+    authorization = access_token,
+    include_meta_info = FALSE
+  )
+  
+  # Replace artist_id with artist_name in the result and store in the list
+  top_tracks$artist_name <- artist_name
+  columns_to_keep <- c("id", "name", "popularity")
+  top_tracks <- top_tracks %>%
+    select(all_of(columns_to_keep))
+    
+  top_tracks_list[[paste0(artist_name)]] <- top_tracks
+}
+
+```
+
+```{r}
+# Flatten top_tracks_list
+top_tracks_popularity <- bind_rows(
+  map(
+    names(top_tracks_list),
+    ~ tibble(
+      artist = .x,
+      track_id = top_tracks_list[[.x]]$id,
+      track = top_tracks_list[[.x]]$name,
+      popularity = top_tracks_list[[.x]]$popularity
+    )
+  )
+)
+
+
+# Reorder the data frame based on the median popularity
+sorted_data <- top_tracks_popularity %>%
+  group_by(artist) %>%
+  summarize(median_popularity = median(popularity)) %>%
+  arrange(median_popularity)
+
+top_tracks_popularity <- top_tracks_popularity %>%
+  left_join(artist_catalogue %>% select(artist, followers), by = "artist")
+
+```
+
+```{r}
+top_100_tracks <- top_tracks_popularity %>%
+  arrange(desc(`popularity`)) %>%  
+  slice_head(n = 100)
+
+top_100_track_ids <- paste0(top_100_tracks$track_id, collapse = ',')
+
+bottom_100_tracks <- top_tracks_popularity %>%
+  arrange(desc(`popularity`)) %>%  
+  slice_tail(n = 100)
+
+bottom_100_track_ids <- paste0(bottom_100_tracks$track_id, collapse = ',')
+
+```
+
+```{r, echo=TRUE}
+top_tracks_audio_features <- get_track_audio_features(top_100_track_ids, authorization = access_token)
+
+bottom_tracks_audio_features <- get_track_audio_features(bottom_100_track_ids, authorization = access_token)
+
+```
+
+```{r}
+top_tracks_audio_features <- top_tracks_audio_features %>%
+  left_join(top_tracks_popularity, by = c("id" = "track_id")) %>%
+  select(artist, track, id, popularity, danceability, energy, key, loudness, mode, speechiness, acousticness, instrumentalness, valence, tempo, duration_ms)
+
+bottom_tracks_audio_features <- bottom_tracks_audio_features %>%
+  left_join(top_tracks_popularity, by = c("id" = "track_id")) %>%
+  select(artist, track, id, popularity, danceability, energy, key, loudness, mode, speechiness, acousticness, instrumentalness, valence, tempo, duration_ms)
+
+```
+
+The data retrieved through web scraping is saved to a relational database so that it is done once. The final structure of the data consists of 2 data frames:
+
+1. **artist_catalogue**
+
+    + rank
+    + artist
+    + id
+    + followers
+    + popularity
+    + followers_rank
+    + popularity_rank
+    + quadrant
+    
+2. **top_tracks_audio_features**
+
+    + audio features of the top 100 tracks by artists in this list
+
+## Analysis
+The graphs below show the total follower count and boxplots of the top 10 tracks by each artist at the end of 2023 in the UK. The top tracks are those with the highest ‘popularity’, which ranges between 0 and 100. According to Spotify, it is ‘calculated by algorithm and is based, in the most part, on the total number of plays the track has had and how recent those plays are’. In effect, assuming that popularity is a normalised measure of streams of a track, there is a rate of decay applied, meaning older plays count for less.
+
+```{r, include=FALSE}
+library(plotly)
+
+```
+
+```{r}
+followers_plot <- ggplot(artist_catalogue, 
+         aes(
+           x = followers, 
+           y = reorder(artist, followers),
+           text = (paste(
+             artist, "<br>",
+             "Followers: ", followers))
+           )) +
+  geom_col(aes(fill = followers)) +
+  scale_fill_continuous() +
+  scale_x_continuous(labels = function(x) paste0(x / 1e6)) +  # Format labels in millions
+  labs(title = "Followers Distribution by Artist", x = "Followers (M)", y = "Artist") +
+  theme(axis.text.y = element_text(angle = 0, hjust = 1, size = 4),
+        plot.margin = margin(t = 0.2, b = 0.2, l = 1, r = 1, unit = "cm"))
+
+```
+
+```{r}
+popularity_plot <- ggplot(
+  top_tracks_popularity,
+  aes(
+    x = factor(artist, levels = sorted_data$artist),
+    y = popularity
+  )) +
+  geom_boxplot(alpha = 1) +
+  labs(
+    title = "Popularity distribution of top tracks by artist",
+    x = "Popularity",
+    y = "Artist"
+  ) +
+  theme(
+    axis.text.y = element_text(hjust = 1, size = 4),
+    plot.title = element_text(hjust = 0.5),
+    plot.margin = margin(t = 0.2, b = 0.2, l = 1, r = 2, unit = "cm")
+  ) +
+  coord_flip()
+
+```
+
+```{r}
+ggplotly(followers_plot, tooltip = c("text"))
+ggplotly(popularity_plot)
+
+```
+
+Internally, the popularity metric determines how likely songs are placed in editorial playlist and increase an artist’s ‘reach’. Some of these reached listeners could convert to followers of an artist, ultimately forming a positive feedback loop. This implies younger artists who are currently active have an advantage in terms of popularity, reach, and following. There is also large variability on the consistency of track popularity, for example, for the difference between the most popular and 10th most popular track, Eminem is 7 whereas The Ronettes is 49. The results of a rudimentary linear regression with no controls suggest there is a moderate negative relationship between follower count (which implies endurance) and variability in track popularity (i.e., consistency).
+
+```{r, include=FALSE}
+suppressWarnings(library(lmtest))
+suppressWarnings(library(knitr))
+suppressWarnings(library(broom))
+```
+
+```{r}
+# Calculate standard deviation of popularity for each artist
+artist_variability <- top_tracks_popularity %>%
+  group_by(artist) %>%
+  summarize(popularity_std_dev = sd(popularity, na.rm = TRUE)) %>%
+  arrange(popularity_std_dev) %>%
+  mutate(rank = row_number())
+
+artist_variability <- merge(artist_variability, artist_catalogue, by = "artist")
+
+# Fit a linear regression model
+regression_model <- lm(popularity_std_dev ~ followers, data = artist_variability)
+tidy_summary <- tidy(regression_model)
+kable(tidy_summary, format = "markdown")
+```
+
+To measure engagement, I adopt popularity as the metric as it reflects how often their music is streamed. Below is a scatter plot of the RS ranking against artist popularity:
+
+```{r}
+# Scatter plot 
+artist_catalogue$followers_rank <- rank(-artist_catalogue$followers, ties.method = "min") 
+artist_catalogue$popularity_rank <- rank(-artist_catalogue$popularity, ties.method = "min")
+
+x_mid <- mean(c(max(artist_catalogue$popularity_rank, na.rm = TRUE), 
+                min(artist_catalogue$popularity_rank, na.rm = TRUE)))
+
+y_mid <- mean(c(max(artist_catalogue$rank, na.rm = TRUE), 
+                min(artist_catalogue$rank, na.rm = TRUE)))
+
+scatter_plot <- artist_catalogue %>% 
+  mutate(quadrant = case_when(popularity_rank > x_mid & rank > y_mid   ~ "Q1",
+                              popularity_rank <= x_mid & rank > y_mid  ~ "Q2",
+                              popularity_rank <= x_mid & rank <= y_mid ~ "Q3",
+                              TRUE                                         ~ "Q4")) %>% 
+  ggplot(aes(
+    x = popularity_rank, 
+    y = rank, 
+    color = quadrant, 
+    label = artist,
+    text = glue::glue("{artist} <br> RS Rank: {rank} <br> Popularity Rank: {popularity_rank} <br> Quadrant: {quadrant}")
+    )) +
+  geom_vline(xintercept = x_mid) + 
+  geom_hline(yintercept = y_mid) + 
+  geom_point() +
+  labs(title = "RS Rank vs Popularity Rank",
+       x = "Popularity Rank",
+       y = "RS Rank")
+
+```
+
+```{r}
+ggplotly(scatter_plot, tooltip = c("text"))
+```
+
+The RS list is explicitly ranked based on the importance a given artists. I did not find any statistically significant relationship between the RS rank and artists' popularity. Overall, artists in Q2 and Q3 have high engagement and their music has endured well at the end of 2023. I now compare the audio features of the 100 top and bottom tracks by these artists to check if they hold any explanatory power:
+
+```{r, include=FALSE}
+summary(top_tracks_audio_features)
+summary(bottom_tracks_audio_features)
+
+```
+
+```{r, include=FALSE}
+library(ggjoy)
+
+```
+
+```{r, message=FALSE}
+combined_data <- bind_rows(
+  mutate(top_tracks_audio_features, category = "Top Tracks"),
+  mutate(bottom_tracks_audio_features, category = "Bottom Tracks")
+)
+
+# Reshape the data for facet_wrap
+combined_data_long <- tidyr::pivot_longer(
+  combined_data,
+  cols = c("danceability", "energy", "valence", "acousticness"),
+  names_to = "variable"
+)
+
+# Create joyplots for Danceability, Energy, Valence and Mode
+suppressWarnings({
+
+joyplots_combined <- ggplot(combined_data_long, aes(x = value, y = after_stat(density), fill = category, color = category)) + 
+  geom_joy() + 
+  facet_wrap(~ variable, scales = "free_x") +  
+  theme_joy() +
+  labs(title = "Joyplot Comparison of Danceability, Energy, Valence, and Acousticness",
+       x = NULL,
+       y = "Density") +
+  scale_x_continuous(breaks = NULL) +
+  theme(legend.position = "bottom",  
+        legend.key.size = unit(0.3, "cm"))
+})
+
+# Print
+print(joyplots_combined)
+
+```
+
+
+Based on the summary statistics I expanded and plotted 4 features, according to Spotify Web API:
+
+
+1. **Danceability**: Measures how suitable a track is for dancing based on tempo, rhythm stability, beat strength, and regularity.
+
+2. **Energy**: A perceptual measure from 0.0 to 1.0 representing intensity, activity, and features like dynamic range, loudness, and entropy.
+
+3. **Valence**: Ranges from 0.0 to 1.0, indicating musical positiveness. High valence implies a positive mood (e.g., happy), while low valence suggests a negative mood (e.g., sad).
+
+4. **Acousticness**: A confidence measure from 0.0 to 1.0 indicating whether the track is acoustic. A higher value implies higher confidence in the track being acoustic.
+
+The joyplot shows that the most popular tracks tend to be much less acoustic than the least popular ones. One implication could be that the genres which are dominated by acoustic instruments are less popular now and did not endure as well. The plot also shows that top tracks tend to be higher energy, more danceable, and less positive. 
+
+## Appendix: All code in this assignment
+
+```{r ref.label=knitr::all_labels(), echo=TRUE, eval=FALSE} 
+```
